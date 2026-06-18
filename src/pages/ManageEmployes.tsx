@@ -7,7 +7,7 @@ import {
   Paper,
   CircularProgress,
 } from "@mui/material";
-import { getAuth, createUserWithEmailAndPassword } from "../lib/firebase";
+import { createAuthUserWithoutSwitchingSession } from "../lib/firebase";
 import { doc, setDoc, Timestamp } from "../lib/firebase";
 import { db } from "../lib/firebase";
 
@@ -23,15 +23,13 @@ const AddUserPage = () => {
       return;
     }
 
-    const auth = getAuth();
     setLoading(true);
     setStatus("");
 
     try {
-      const userCredential = await createUserWithEmailAndPassword(
-        auth,
+      const userCredential = await createAuthUserWithoutSwitchingSession(
         gmail,
-        "123456" // default password
+        "Enkonix@123" // default password
       );
       const uid = userCredential.user.uid;
 

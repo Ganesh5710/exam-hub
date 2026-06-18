@@ -1,13 +1,15 @@
 import { useEffect } from "react";
-import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { Routes, Route, Navigate, Outlet } from "react-router-dom";
 import { useAuthStore } from "./store/authStore";
 import { useThemeStore } from "./store/themeStore";
+import { Toaster } from "react-hot-toast";
+
+// Pages & Components
 import Dashboard from "./pages/Dashboard";
 import Settings from "./pages/Settings";
 import Login from "./pages/Login";
 import Layout from "./components/Layout";
 import UserManagement from "./pages/UserManagement";
-import { Toaster } from "react-hot-toast";
 import CodingRound from "./pages/CodingRound";
 import MCQRound from "./pages/MCQRound";
 import ViewScores from "./pages/ViewScores";
@@ -17,24 +19,18 @@ import Takecomm from "./pages/Takecomm";
 import AdminMonitor from "./pages/AdminMonitor";
 import ListeningRound from "./pages/ListeningRound";
 import AddingMCQs from "./pages/AddingMCQs";  
+
 function App() {
   const { user, loading, userRole } = useAuthStore();
   const { theme } = useThemeStore();
-  const navigate = useNavigate();
 
-  useEffect(() => {
-    if (!loading) {
-      if (!user) {
-        navigate("/login");
-      }
-    }
-  }, [user, loading, navigate]);
-
+  // Handle Theme switching
   useEffect(() => {
     document.documentElement.classList.remove("light", "dark");
     document.documentElement.classList.add(theme);
   }, [theme]);
 
+  // Loading Screen
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center dark:bg-gray-900">
@@ -43,43 +39,49 @@ function App() {
     );
   }
 
+  // Helper helper to dynamically resolve landing spot based on user role
+  const getRedirectPath = () => userRole === "hr" ? "/dashboard" : "/MCQRound";
+
   return (
     <>
       <Toaster position="top-right" />
       <Routes>
+        {/* PUBLIC ROUTE: Login */}
         <Route
           path="/login"
-          element={!user ? <Login /> : <Navigate to="/" />}
+          element={!user ? <Login /> : <Navigate to={getRedirectPath()} replace />}
         />
-        <Route path="/" element={user ? <Layout /> : <Navigate to="/login" />}>
-          {/* HR-only routes */}
-          {userRole === 'hr' && (
-            <>
-              <Route index element={<Dashboard />} />
+
+        {/* PROTECTED ROUTES (Requires Authentication) */}
+        <Route element={user ? <Outlet /> : <Navigate to="/login" replace />}>
+          <Route path="/" element={<Layout />}>
+            
+            {/* Root index path sends them to their respective dashboard */}
+            <Route index element={<Navigate to={getRedirectPath()} replace />} />
+
+            {/* HR ONLY ROUTES */}
+            <Route element={userRole === "hr" ? <Outlet /> : <Navigate to="/MCQRound" replace />}>
+              <Route path="dashboard" element={<Dashboard />} />
               <Route path="ViewScores" element={<ViewScores />} />
               <Route path="questions" element={<QuestionBank />} />
               <Route path="users" element={<UserManagement />} />
-              <Route path="CommunicationRound" element={<CommunicationRound/>}/>
+              <Route path="CommunicationRound" element={<CommunicationRound />} />
               <Route path="settings" element={<Settings />} />
               <Route path="AddingMCQs" element={<AddingMCQs />} />
-            </>
-          )}
-          
-          {/* Routes accessible to both HR and regular users */}
-          <Route path="MCQRound" element={<MCQRound />} />
-          <Route path="Takecomm" element={<Takecomm />} />
-          <Route path="CodingRound" element={<CodingRound />} />
-          <Route path="AdminMonitor" element={<AdminMonitor />} />
-          <Route path="ListeningRound" element={<ListeningRound />} />
-          
-          {/* Redirect regular users to MCQ Round if they try to access HR-only routes */}
-          {userRole === 'user' && (
-            <>
-              <Route path="*" element={<Navigate to="/MCQRound" />} />
-            </>
-          )}
+              <Route path="AdminMonitor" element={<AdminMonitor />} />
+            </Route>
+
+            {/* CANDIDATE / SHARED PROTECTED ROUTES */}
+            <Route path="MCQRound" element={<MCQRound />} />
+            <Route path="Takecomm" element={<Takecomm />} />
+            <Route path="CodingRound" element={<CodingRound />} />
+            <Route path="ListeningRound" element={<ListeningRound />} />
+
+          </Route>
         </Route>
-        <Route path="*" element={<Navigate to="/" />} />
+
+        {/* GLOBAL CATCH-ALL: Redirects unauthenticated to login, authenticated to home base */}
+        <Route path="*" element={<Navigate to={user ? getRedirectPath() : "/login"} replace />} />
       </Routes>
     </>
   );

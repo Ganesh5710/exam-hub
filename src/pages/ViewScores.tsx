@@ -696,7 +696,7 @@ const ViewScores = () => {
             aria-label="Delete scores for users without active profiles"
           >
             <Trash2 className="w-4 h-4" />
-            Cleanup Orphans
+            Cleanup Results
           </button>
         </div>
         <div className="overflow-x-auto">

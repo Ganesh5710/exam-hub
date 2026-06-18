@@ -857,10 +857,10 @@ const CameraAuthGate = ({ onSuccess, user }: { onSuccess: () => void; user: any 
                     <AlertTriangle className="w-5 h-5 text-orange-500 dark:text-orange-400" />
                     <div>
                       <p className="font-medium text-orange-800 dark:text-orange-300">
-                        Current Violations: {violations}/5
+                        Current Violations: {violations}/2
                       </p>
                       <p className="text-sm text-orange-600 dark:text-orange-400">
-                        5 violations will result in access revocation
+                        2 violations will result in access revocation
                       </p>
                     </div>
                   </div>
@@ -1432,7 +1432,7 @@ function Layout() {
   // Define all navigation items
   const allNavigationItems = [
     {
-      path: "/",
+      path: "/dashboard",
       icon: LayoutDashboard,
       label: "Dashboard",
       roles: ['hr']

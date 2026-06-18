@@ -6,7 +6,7 @@ import {
   User
 } from '../lib/firebase';
 import { auth, db } from '../lib/firebase';
-import { doc, getDoc, collection, query, where, getDocs } from '../lib/firebase';
+import { collection, doc, getDoc, getDocs, query, where } from '../lib/firebase';
 import toast from 'react-hot-toast';
 
 interface UserData {
@@ -18,10 +18,29 @@ interface UserData {
   permissions: string[];
 }
 
-// Helper function to determine user role based on email
+const AUTH_SESSION_KEY = 'exam_hub_active_login';
+const ADMIN_EMAILS = new Set(['hr@enkonix.in', 'ceo@enkonix.in']);
+
 const getUserRole = (email: string | null): 'hr' | 'user' => {
-  if (!email) return 'user';
-  return email.toLowerCase() === 'hr@enkonix.in' ? 'hr' : 'user';
+  if (email && ADMIN_EMAILS.has(email.toLowerCase())) return 'hr';
+  return 'user';
+};
+
+const fetchUserData = async (uid: string): Promise<UserData | null> => {
+  const directSnap = await getDoc(doc(db, 'users', uid));
+  if (directSnap.exists()) {
+    return directSnap.data() as UserData;
+  }
+
+  const usersRef = collection(db, 'users');
+  const q = query(usersRef, where('uid', '==', uid));
+  const querySnapshot = await getDocs(q);
+
+  if (!querySnapshot.empty) {
+    return querySnapshot.docs[0].data() as UserData;
+  }
+
+  return null;
 };
 
 interface AuthState {
@@ -56,22 +75,15 @@ export const useAuthStore = create<AuthState>((set) => ({
         }
       }
 
+      sessionStorage.setItem(AUTH_SESSION_KEY, 'true');
       const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      const userData = await fetchUserData(userCredential.user.uid);
       const userRole = getUserRole(userCredential.user.email);
-      set({ user: userCredential.user, userRole });
-      
-      // Fetch additional user data from Firestore
-      const usersRef = collection(db, 'users');
-      const q = query(usersRef, where('uid', '==', userCredential.user.uid));
-      const querySnapshot = await getDocs(q);
-      
-      if (!querySnapshot.empty) {
-        const userData = querySnapshot.docs[0].data() as UserData;
-        set({ userData });
-      }
+      set({ user: userCredential.user, userData, loading: false, userRole });
       
       toast.success('Successfully signed in!');
     } catch (error: any) {
+      sessionStorage.removeItem(AUTH_SESSION_KEY);
       console.error('Sign in error:', error);
       toast.error(error.message || 'Failed to sign in');
       throw error;
@@ -79,6 +91,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
   signOut: async () => {
     try {
+      sessionStorage.removeItem(AUTH_SESSION_KEY);
       await firebaseSignOut(auth);
       set({ user: null, userData: null, userRole: 'user' });
       toast.success('Successfully signed out!');
@@ -98,17 +111,19 @@ export const useAuthStore = create<AuthState>((set) => ({
 // Initialize auth state listener
 onAuthStateChanged(auth, async (user) => {
   const state = useAuthStore.getState();
+
+  if (user && sessionStorage.getItem(AUTH_SESSION_KEY) !== 'true') {
+    await firebaseSignOut(auth);
+    state.setUserData(null);
+    state.setUser(null);
+    return;
+  }
+
   if (user) {
-    // Fetch user data when auth state changes
-    const usersRef = collection(db, 'users');
-    const q = query(usersRef, where('uid', '==', user.uid));
-    const querySnapshot = await getDocs(q);
-    
-    if (!querySnapshot.empty) {
-      const userData = querySnapshot.docs[0].data() as UserData;
-      state.setUserData(userData);
-    }
+    const userData = await fetchUserData(user.uid);
+    state.setUserData(userData);
   } else {
+    sessionStorage.removeItem(AUTH_SESSION_KEY);
     state.setUserData(null);
   }
   state.setUser(user);
