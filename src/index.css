@@ -1,0 +1,149 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* Dark mode transitions */
+.dark {
+  color-scheme: dark;
+}
+
+* {
+  transition: background-color 0.3s ease, border-color 0.3s ease;
+}
+
+/* Form styles */
+input,
+select,
+textarea {
+  @apply border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:bg-gray-800 dark:border-gray-700 dark:text-white;
+}
+
+/* Calendar styles */
+.fc {
+  @apply font-sans;
+}
+
+.fc-theme-standard .fc-scrollgrid,
+.fc-theme-standard td,
+.fc-theme-standard th {
+  @apply border-gray-200 dark:border-gray-700;
+}
+
+.fc-theme-standard .fc-scrollgrid {
+  @apply dark:bg-gray-800;
+}
+
+.fc .fc-toolbar {
+  @apply dark:text-white;
+}
+
+.fc .fc-button {
+  @apply dark:bg-gray-700 dark:border-gray-600 dark:text-white dark:hover:bg-gray-600;
+}
+
+.fc .fc-button-primary {
+  @apply bg-blue-600 border-blue-600 hover:bg-blue-700 focus:bg-blue-700 dark:bg-blue-600 dark:border-blue-600 dark:hover:bg-blue-700;
+}
+
+.fc .fc-button-primary:disabled {
+  @apply bg-blue-400 border-blue-400 dark:bg-blue-500 dark:border-blue-500;
+}
+
+.fc .fc-daygrid-day.fc-day-today {
+  @apply bg-blue-50 dark:bg-blue-900/20;
+}
+
+.fc .fc-highlight {
+  @apply bg-blue-100 dark:bg-blue-900/30;
+}
+
+.fc .fc-event {
+  @apply cursor-pointer dark:border-gray-600;
+}
+
+.fc .fc-col-header-cell-cushion,
+.fc .fc-daygrid-day-number,
+.fc .fc-list-day-text,
+.fc .fc-list-day-side-text {
+  @apply dark:text-gray-300;
+}
+
+.fc-theme-standard .fc-list-day-cushion {
+  @apply dark:bg-gray-700;
+}
+
+.fc .fc-list-event:hover td {
+  @apply dark:bg-gray-700;
+}
+
+/* Modal styles */
+.modal-backdrop {
+  @apply fixed inset-0 bg-black bg-opacity-50 z-40;
+}
+
+.modal-content {
+  @apply fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-white dark:bg-gray-800 rounded-lg shadow-xl z-50;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+  .sidebar-mobile {
+    @apply fixed inset-y-0 left-0 transform -translate-x-full transition-transform duration-300 ease-in-out z-30;
+  }
+
+  .sidebar-mobile.open {
+    @apply translate-x-0;
+  }
+
+  .main-content {
+    @apply ml-0;
+  }
+}
+
+/* Toast customization */
+.toast-theme {
+  @apply dark:bg-gray-800 dark:text-white !important;
+}
+
+/* Dashboard card styles */
+.dashboard-card {
+  @apply bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6;
+}
+
+.dashboard-card-title {
+  @apply text-lg font-semibold text-gray-900 dark:text-white mb-4;
+}
+
+.dashboard-card-value {
+  @apply text-3xl font-bold text-gray-900 dark:text-white;
+}
+
+.dashboard-card-label {
+  @apply text-sm text-gray-500 dark:text-gray-400;
+}
+
+/* Chart colors for dark mode */
+.dark .recharts-cartesian-grid-horizontal line,
+.dark .recharts-cartesian-grid-vertical line {
+  @apply stroke-gray-700;
+}
+
+.dark .recharts-text {
+  @apply fill-gray-400;
+}
+
+.dark .recharts-tooltip-wrapper {
+  @apply bg-gray-800 border-gray-700;
+}
