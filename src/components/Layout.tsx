@@ -854,7 +854,7 @@ const CameraAuthGate = ({ onSuccess, user }: { onSuccess: () => void; user: any 
   
                 <div className="bg-orange-50 dark:bg-orange-900/40 border border-orange-200 dark:border-orange-700 rounded-lg p-4">
                   <div className="flex items-center space-x-3">
-                    <AlertTriangle className="w-5 h-5 text-orange-500 dark:text-orange-400" />
+                    <AlertTriangle className="w-2 h-2 text-orange-500 dark:text-orange-400" />
                     <div>
                       <p className="font-medium text-orange-800 dark:text-orange-300">
                         Current Violations: {violations}/2
@@ -1049,7 +1049,7 @@ const ContinuousCameraMonitor = ({ user }: { user: any }) => {
       }
       
     } else {
-      setWarningMsg("Access revoked due to excessive violations (5 reached).");
+      setWarningMsg("Access revoked due to excessive violations (2 reached).");
       if (soundEnabled) {
         playAlertSound();
       }
@@ -1503,6 +1503,12 @@ function Layout() {
       path: "/CodingRound",
       icon: Code,
       label: "Coding Round",
+      roles: ['hr', 'user']
+    },
+    {
+      path: "/chat",
+      icon: MessageSquareTextIcon,
+      label: "Chat",
       roles: ['hr', 'user']
     },
   ];

@@ -19,6 +19,7 @@ import Takecomm from "./pages/Takecomm";
 import AdminMonitor from "./pages/AdminMonitor";
 import ListeningRound from "./pages/ListeningRound";
 import AddingMCQs from "./pages/AddingMCQs";  
+import ChatPage from "./pages/ChatPage";
 
 function App() {
   const { user, loading, userRole } = useAuthStore();
@@ -76,6 +77,7 @@ function App() {
             <Route path="Takecomm" element={<Takecomm />} />
             <Route path="CodingRound" element={<CodingRound />} />
             <Route path="ListeningRound" element={<ListeningRound />} />
+            <Route path="chat" element={<ChatPage />} />
 
           </Route>
         </Route>
