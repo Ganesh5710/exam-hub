@@ -27,7 +27,7 @@ import {
 } from "../lib/firebase";
 import { db } from "../lib/firebase";
 import { useAuthStore } from "../store/authStore";
-
+import { socket } from "../lib/socket";
 type ThreadType = "private" | "broadcast";
 type MessageType = "text" | "call_invite";
 
@@ -123,7 +123,7 @@ function ChatPage() {
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
   const remoteDescriptionReady = useRef(false);
-
+ 
   const currentUser = useMemo(() => {
     if (!user?.uid) return null;
     return {
@@ -169,6 +169,15 @@ function ChatPage() {
     return Array.from(uniqueMessages.values());
   }, [messages]);
 
+
+
+  useEffect(() => {
+  if (!user?.uid) return;
+
+  socket.emit("register", user.uid);
+
+  console.log("Registered:", user.uid);
+}, [user?.uid]);
   useEffect(() => {
     if (localVideoRef.current && localStreamRef.current) {
       localVideoRef.current.srcObject = localStreamRef.current;
@@ -204,6 +213,8 @@ function ChatPage() {
 
   useEffect(() => {
     if (!isHr) return;
+
+    
 
     const loadUsers = async () => {
       const found = new Map<string, ChatUser>();
@@ -449,6 +460,7 @@ function ChatPage() {
     localStream.getTracks().forEach((track) => peer.addTrack(track, localStream));
     
     peer.ontrack = (event) => {
+      console.log("Remote Track:", event.track.kind);
       const inboundStream = event.streams?.[0] || remoteStream;
       if (!event.streams?.[0] && event.track && !inboundStream.getTracks().some((track) => track.id === event.track.id)) {
         inboundStream.addTrack(event.track);
@@ -506,102 +518,162 @@ function ChatPage() {
 
     return { peer, signalRef, offerCandidatesRef, answerCandidatesRef };
   };
-
+// start call()
   const startCall = async () => {
-    if (!currentUser) return;
-    const threadId = activeThread.threadId;
-    setActiveCallRoom(threadId);
-    setIsCallActive(true);
-    const { peer, signalRef, answerCandidatesRef } = await preparePeerConnection(threadId, "caller");
-    const offer = await peer.createOffer();
+  console.log("START CALL CLICKED");
 
-    await peer.setLocalDescription(offer);
-    await setDoc(
-      signalRef,
-      {
-        offer: { type: offer.type, sdp: offer.sdp },
-        answer: null,
-        roomName: threadId,
-        createdBy: currentUser.uid,
-        timestamp: serverTimestamp(),
+  if (!currentUser) return;
+
+  if (activeThread.threadId === "hr_broadcast") {
+    alert("Video/Audio calls are only allowed in private chats.");
+    return;
+  }
+
+  const threadId = activeThread.threadId;
+
+  console.log("Thread:", activeThread);
+
+  const { peer, signalRef, answerCandidatesRef } =
+    await preparePeerConnection(threadId, "caller");
+
+  const offer = await peer.createOffer();
+
+  await peer.setLocalDescription(offer);
+
+  await setDoc(
+    signalRef,
+    {
+      offer: {
+        type: offer.type,
+        sdp: offer.sdp,
       },
-      { merge: true }
-    );
+      answer: null,
+      roomName: threadId,
+      createdBy: currentUser.uid,
+      timestamp: serverTimestamp(),
+    },
+    { merge: true }
+  );
 
-    callUnsubs.current.push(
-      onSnapshot(signalRef, async (snapshot) => {
-        const answer = snapshot.data()?.answer;
-        if (answer && !peer.currentRemoteDescription) {
-          await peer.setRemoteDescription(new RTCSessionDescription(answer));
-          remoteDescriptionReady.current = true;
-          await flushQueuedIceCandidates();
+  callUnsubs.current.push(
+    onSnapshot(signalRef, async (snapshot) => {
+      const answer = snapshot.data()?.answer;
+
+      if (answer && !peer.currentRemoteDescription) {
+        await peer.setRemoteDescription(
+          new RTCSessionDescription(answer)
+        );
+
+        remoteDescriptionReady.current = true;
+
+        await flushQueuedIceCandidates();
+      }
+    }),
+
+    onSnapshot(answerCandidatesRef, (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === "added") {
+          addRemoteCandidate(
+            change.doc.data()
+          ).catch(console.error);
         }
-      }),
-      onSnapshot(answerCandidatesRef, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === "added") {
-            addRemoteCandidate(change.doc.data()).catch(console.error);
-          }
-        });
-      })
-    );
+      });
+    })
+  );
 
-    await addDoc(collection(db, "chatThreads", threadId, "messages"), {
+  await addDoc(
+    collection(
+      db,
+      "chatThreads",
+      threadId,
+      "messages"
+    ),
+    {
       senderId: currentUser.uid,
       senderEmail: currentUser.email,
       text: "Video call invite",
       type: "call_invite",
       roomName: threadId,
       timestamp: serverTimestamp(),
-    });
+    }
+  );
 
-    await setDoc(
-      doc(db, "chatThreads", threadId),
-      {
-        threadId,
-        type: activeThread.type,
-        participants: activeThread.type === "broadcast" ? ["all"] : activeThread.participants,
-        lastMessage: "Video call invite",
-        timestamp: serverTimestamp(),
+  await setDoc(
+    doc(db, "chatThreads", threadId),
+    {
+      threadId,
+      type: activeThread.type,
+      participants:
+        activeThread.type === "broadcast"
+          ? ["all"]
+          : activeThread.participants,
+      lastMessage: "Video call invite",
+      timestamp: serverTimestamp(),
+    },
+    { merge: true }
+  );
+};
+
+
+// join call 
+
+ const joinCall = async (roomName: string) => {
+  console.log("Joining Room:", roomName);
+
+  setActiveCallRoom(roomName);
+  setIsCallActive(true);
+
+  const { peer, signalRef, offerCandidatesRef } =
+    await preparePeerConnection(
+      roomName,
+      "callee"
+    );
+
+  const signalSnap = await getDoc(signalRef);
+
+  const offer = signalSnap.data()?.offer;
+
+  if (!offer) {
+    console.error("Offer not found");
+    return;
+  }
+
+  await peer.setRemoteDescription(
+    new RTCSessionDescription(offer)
+  );
+
+  remoteDescriptionReady.current = true;
+
+  await flushQueuedIceCandidates();
+
+  const answer = await peer.createAnswer();
+
+  await peer.setLocalDescription(answer);
+
+  await setDoc(
+    signalRef,
+    {
+      answer: {
+        type: answer.type,
+        sdp: answer.sdp,
       },
-      { merge: true }
-    );
-  };
+      answeredAt: serverTimestamp(),
+    },
+    { merge: true }
+  );
 
-  const joinCall = async (roomName: string) => {
-    setActiveCallRoom(roomName);
-    setIsCallActive(true);
-    const { peer, signalRef, offerCandidatesRef } = await preparePeerConnection(roomName, "callee");
-    const signalSnap = await getDoc(signalRef);
-    const offer = signalSnap.data()?.offer;
-    if (!offer) return;
-
-    await peer.setRemoteDescription(new RTCSessionDescription(offer));
-    remoteDescriptionReady.current = true;
-    await flushQueuedIceCandidates();
-
-    const answer = await peer.createAnswer();
-    await peer.setLocalDescription(answer);
-
-    await setDoc(
-      signalRef,
-      {
-        answer: { type: answer.type, sdp: answer.sdp },
-        answeredAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    callUnsubs.current.push(
-      onSnapshot(offerCandidatesRef, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === "added") {
-            addRemoteCandidate(change.doc.data()).catch(console.error);
-          }
-        });
-      })
-    );
-  };
+  callUnsubs.current.push(
+    onSnapshot(offerCandidatesRef, (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === "added") {
+          addRemoteCandidate(
+            change.doc.data()
+          ).catch(console.error);
+        }
+      });
+    })
+  );
+};
 
   const toggleMicrophone = () => {
     const audioTrack = localStreamRef.current?.getAudioTracks()[0];
