@@ -1,76 +1,135 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Mic,
-  MicOff,
+  Activity,
+  Camera,
+  CameraOff,
+  Check,
+  Circle,
   MonitorUp,
+  MoreVertical,
   Phone,
+  PhoneCall,
   PhoneOff,
+  Radio,
+  Search,
   Send,
   Trash2,
   Users,
-  Video,
-  VideoOff,
+  Volume2,
+  Wifi,
+  WifiOff,
+  Mic,
+  MicOff,
 } from "lucide-react";
 import {
   addDoc,
   collection,
   deleteDoc,
   doc,
-  getDoc,
   getDocs,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
 } from "../lib/firebase";
 import { db } from "../lib/firebase";
-import { useAuthStore } from "../store/authStore";
 import { socket } from "../lib/socket";
-type ThreadType = "private" | "broadcast";
-type MessageType = "text" | "call_invite";
+import { useAuthStore } from "../store/authStore";
 
-type ChatUser = {
+type ThreadType = "private" | "broadcast";
+type MessageType = "text" | "call_event";
+type MediaMode = "audio" | "video";
+
+enum CallState {
+  Idle = "idle",
+  Calling = "calling",
+  Ringing = "ringing",
+  Connecting = "connecting",
+  Connected = "connected",
+  Reconnecting = "reconnecting",
+  Rejected = "rejected",
+  Missed = "missed",
+  Ended = "ended",
+}
+
+interface ChatUser {
   uid: string;
   email: string;
   name: string;
-};
+  role?: string;
+  online?: boolean;
+  lastSeen?: number;
+}
 
-type ChatThread = {
+interface ChatThread {
   threadId: string;
   type: ThreadType;
   participants: string[];
-  lastMessage?: string;
-  timestamp?: any;
+  participantNames?: Record<string, string>;
+  participantEmails?: Record<string, string>;
   title?: string;
-};
+  lastMessage?: string;
+  lastMessageAt?: any;
+  timestamp?: any;
+  unreadBy?: Record<string, number>;
+  typing?: Record<string, number>;
+}
 
-type ChatMessage = {
+interface ChatMessage {
   id: string;
   senderId: string;
   senderEmail?: string;
   text: string;
   type: MessageType;
-  roomName?: string;
+  callId?: string;
   timestamp?: any;
-};
+  deleted?: boolean;
+}
+
+interface IncomingCall {
+  callId: string;
+  threadId: string;
+  callerUid: string;
+  callerName: string;
+  callerEmail?: string;
+  participantUids: string[];
+  mode: MediaMode;
+}
+
+interface CallParticipant {
+  uid: string;
+  name: string;
+  stream?: MediaStream;
+  micEnabled: boolean;
+  cameraEnabled: boolean;
+  screenSharing: boolean;
+  speaking: boolean;
+  connectionState: RTCPeerConnectionState | "new";
+  videoQuality: "HD" | "SD" | "Audio";
+}
+
+interface PeerBundle {
+  peer: RTCPeerConnection;
+  remoteStream: MediaStream;
+  queuedIce: RTCIceCandidateInit[];
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+}
 
 const HR_BROADCAST_THREAD_ID = "hr_broadcast";
 const HR_EMAILS = new Set(["hr@enkonix.in", "ceo@enkonix.in"]);
-const configuration: RTCConfiguration = {
+const MISSED_CALL_MS = 30_000;
+const TYPING_TTL_MS = 4_000;
+
+const rtcConfiguration: RTCConfiguration = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun.services.mozilla.com" },
+    { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
     {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
+      urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
       username: "openrelayproject",
       credential: "openrelayproject",
     },
@@ -79,122 +138,410 @@ const configuration: RTCConfiguration = {
 };
 
 const normalizeEmail = (email?: string | null) => (email || "").trim().toLowerCase();
-
-const makePrivateThreadId = (hrUid: string, userUid: string) =>
-  `private_${hrUid}_${userUid}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-
+const now = () => Date.now();
 const getMillis = (value: any) => {
   if (!value) return 0;
   if (typeof value.toMillis === "function") return value.toMillis();
   if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
   return 0;
+};
+
+const getPrivateThreadId = (uidA: string, uidB: string) =>
+  `private_${[uidA, uidB].sort().join("_")}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+const getInitials = (value?: string) =>
+  (value || "User")
+    .split(/[\s@._-]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("");
+
+const formatTime = (timestamp: any) => {
+  const millis = getMillis(timestamp);
+  if (!millis) return "Sending";
+  return new Date(millis).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
+const playTone = (audioRef: React.MutableRefObject<AudioContext | null>, stopRef: React.MutableRefObject<(() => void) | null>) => {
+  stopRef.current?.();
+  const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioContextClass) return;
+  const context = new AudioContextClass();
+  const gain = context.createGain();
+  gain.gain.value = 0.04;
+  gain.connect(context.destination);
+  let stopped = false;
+
+  const tick = () => {
+    if (stopped) return;
+    const osc = context.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = 450;
+    osc.connect(gain);
+    osc.start();
+    osc.stop(context.currentTime + 0.35);
+    window.setTimeout(tick, 1100);
+  };
+
+  audioRef.current = context;
+  tick();
+  stopRef.current = () => {
+    stopped = true;
+    void context.close().catch(() => undefined);
+    audioRef.current = null;
+    stopRef.current = null;
+  };
 };
 
 function ChatPage() {
   const { user, userRole } = useAuthStore();
   const isHr = userRole === "hr";
+  const currentUser = useMemo(
+    () =>
+      user?.uid
+        ? {
+            uid: user.uid,
+            email: normalizeEmail(user.email),
+            name: user.displayName || user.email || "User",
+          }
+        : null,
+    [user?.displayName, user?.email, user?.uid]
+  );
+
   const [users, setUsers] = useState<ChatUser[]>([]);
-  const [privateThreads, setPrivateThreads] = useState<ChatThread[]>([]);
-  const [search, setSearch] = useState("");
+  const [presence, setPresence] = useState<Record<string, boolean>>({});
+  const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThread, setActiveThread] = useState<ChatThread>({
     threadId: HR_BROADCAST_THREAD_ID,
     type: "broadcast",
-    participants: [],
+    participants: ["all"],
     title: "HR Broadcast",
   });
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [messageText, setMessageText] = useState("");
-  const [isCallActive, setIsCallActive] = useState(false);
-  const [activeCallRoom, setActiveCallRoom] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
+  const [callState, setCallState] = useState<CallState>(CallState.Idle);
+  const [callId, setCallId] = useState<string | null>(null);
+  const [callThreadId, setCallThreadId] = useState<string | null>(null);
+  const [callParticipants, setCallParticipants] = useState<Record<string, CallParticipant>>({});
+  const [mediaMode, setMediaMode] = useState<MediaMode>("video");
   const [micEnabled, setMicEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
-  const [localVideoEnabled, setLocalVideoEnabled] = useState(false);
-  const [remoteVideoEnabled, setRemoteVideoEnabled] = useState(false);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [streamVersion, setStreamVersion] = useState(0);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
-  const pc = useRef<RTCPeerConnection | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const remoteStreamRef = useRef<MediaStream | null>(null);
-  const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([]);
-  const callUnsubs = useRef<Array<() => void>>([]);
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
-  const remoteDescriptionReady = useRef(false);
- 
-  const currentUser = useMemo(() => {
-    if (!user?.uid) return null;
-    return {
-      uid: user.uid,
-      email: normalizeEmail(user.email),
-      name: user.email || "User",
-    };
-  }, [user?.uid, user?.email]);
+  const peersRef = useRef<Record<string, PeerBundle>>({});
+  const callIdRef = useRef<string | null>(null);
+  const callThreadIdRef = useRef<string | null>(null);
+  const missedTimerRef = useRef<number | null>(null);
+  const typingTimerRef = useRef<number | null>(null);
+  const toneContextRef = useRef<AudioContext | null>(null);
+  const stopToneRef = useRef<(() => void) | null>(null);
+  const messagesUnsubRef = useRef<(() => void) | null>(null);
+  const registeredUidRef = useRef<string | null>(null);
+  const remoteVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
 
-  {/* FIXED BUG: Normalizing lowercase string spaces to permanently strip out multi-UID duplication records */}
+  const privateThreads = useMemo(
+    () =>
+      threads
+        .filter((thread) => thread.type === "private" && currentUser?.uid && thread.participants.includes(currentUser.uid))
+        .sort((a, b) => getMillis(b.lastMessageAt || b.timestamp) - getMillis(a.lastMessageAt || a.timestamp)),
+    [currentUser?.uid, threads]
+  );
+
   const filteredUsers = useMemo(() => {
     const term = search.trim().toLowerCase();
-    const uniqueUsers = new Map<string, ChatUser>();
+    const unique = new Map<string, ChatUser>();
     users.forEach((item) => {
-      if (!item.uid || item.uid === currentUser?.uid) return;
-      if (HR_EMAILS.has(normalizeEmail(item.email))) return;
-      if (!`${item.name} ${item.uid} ${item.email}`.toLowerCase().includes(term)) return;
-      
-      const standardizedName = item.name.toLowerCase().replace(/\s+/g, " ").trim();
-      const identityKey = normalizeEmail(item.email) || standardizedName;
-      uniqueUsers.set(identityKey, item);
+      if (!currentUser || item.uid === currentUser.uid || HR_EMAILS.has(normalizeEmail(item.email))) return;
+      if (!`${item.name} ${item.email} ${item.uid}`.toLowerCase().includes(term)) return;
+      unique.set(item.uid, { ...item, online: presence[item.uid] });
     });
-    return Array.from(uniqueUsers.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [currentUser?.uid, search, users]);
+    return Array.from(unique.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [currentUser, presence, search, users]);
 
-  const visiblePrivateThreads = useMemo(() => {
-    const uniqueThreads = new Map<string, ChatThread>();
-    privateThreads
-      .filter((thread) => thread.threadId)
-      .filter((thread) => thread.type === "private")
-      .filter((thread) => !!currentUser?.uid && thread.participants.includes(currentUser.uid))
-      .filter((thread) => !thread.participants.every((participantId) => participantId === currentUser?.uid))
-      .forEach((thread) => uniqueThreads.set(thread.threadId, thread));
+  const activeTypingNames = useMemo(() => {
+    if (!activeThread.typing || !currentUser) return [];
+    return Object.entries(activeThread.typing)
+      .filter(([uid, timestamp]) => uid !== currentUser.uid && now() - Number(timestamp) < TYPING_TTL_MS)
+      .map(([uid]) => activeThread.participantNames?.[uid] || users.find((item) => item.uid === uid)?.name || "Someone");
+  }, [activeThread, currentUser, users]);
 
-    return Array.from(uniqueThreads.values()).sort((a, b) => getMillis(b.timestamp) - getMillis(a.timestamp));
-  }, [currentUser?.uid, privateThreads]);
+  const canCall = activeThread.type === "private" && callState === CallState.Idle;
 
-  const visibleMessages = useMemo(() => {
-    const uniqueMessages = new Map<string, ChatMessage>();
-    messages.forEach((message) => {
-      if (message.id) uniqueMessages.set(message.id, message);
-    });
-    return Array.from(uniqueMessages.values());
-  }, [messages]);
-
-
-
-  useEffect(() => {
-  if (!user?.uid) return;
-
-  socket.emit("register", user.uid);
-
-  console.log("Registered:", user.uid);
-}, [user?.uid]);
-  useEffect(() => {
-    if (localVideoRef.current && localStreamRef.current) {
-      localVideoRef.current.srcObject = localStreamRef.current;
-    }
-  }, [streamVersion, isCallActive, localVideoEnabled]);
-
-  useEffect(() => {
-    if (remoteVideoRef.current && remoteStreamRef.current) {
-      remoteVideoRef.current.srcObject = remoteStreamRef.current;
-    }
-  }, [streamVersion, isCallActive, remoteVideoEnabled]);
-
-  useEffect(() => {
-    return () => {
-      void endCall(false);
-    };
+  const upsertParticipant = useCallback((uid: string, patch: Partial<CallParticipant>) => {
+    setCallParticipants((prev) => ({
+      ...prev,
+      [uid]: {
+        uid,
+        name: patch.name || prev[uid]?.name || "Participant",
+        micEnabled: patch.micEnabled ?? prev[uid]?.micEnabled ?? true,
+        cameraEnabled: patch.cameraEnabled ?? prev[uid]?.cameraEnabled ?? false,
+        screenSharing: patch.screenSharing ?? prev[uid]?.screenSharing ?? false,
+        speaking: patch.speaking ?? prev[uid]?.speaking ?? false,
+        connectionState: patch.connectionState ?? prev[uid]?.connectionState ?? "new",
+        videoQuality: patch.videoQuality ?? prev[uid]?.videoQuality ?? "Audio",
+        stream: patch.stream ?? prev[uid]?.stream,
+      },
+    }));
   }, []);
+
+  const stopTone = useCallback(() => stopToneRef.current?.(), []);
+
+  const writeCallData = useCallback(async (threadId: string, id: string, data: Record<string, unknown>) => {
+    await setDoc(
+      doc(db, "chatThreads", threadId, "callData", id),
+      {
+        callId: id,
+        threadId,
+        updatedAt: serverTimestamp(),
+        ...data,
+      },
+      { merge: true }
+    ).catch(() => undefined);
+  }, []);
+
+  const addCallMessage = useCallback(
+    async (threadId: string, text: string, id?: string) => {
+      if (!currentUser) return;
+      await addDoc(collection(db, "chatThreads", threadId, "messages"), {
+        senderId: currentUser.uid,
+        senderEmail: currentUser.email,
+        text,
+        type: "call_event",
+        callId: id || callIdRef.current,
+        timestamp: serverTimestamp(),
+      });
+      await setDoc(
+        doc(db, "chatThreads", threadId),
+        {
+          lastMessage: text,
+          lastMessageAt: serverTimestamp(),
+          unreadBy: {},
+        },
+        { merge: true }
+      );
+    },
+    [currentUser]
+  );
+
+  const cleanupCall = useCallback(
+    async (nextState: CallState = CallState.Ended, notify = true) => {
+      const activeCallId = callIdRef.current;
+      const activeThreadId = callThreadIdRef.current;
+      if (missedTimerRef.current) window.clearTimeout(missedTimerRef.current);
+      missedTimerRef.current = null;
+      stopTone();
+
+      Object.values(peersRef.current).forEach(({ peer }) => peer.close());
+      peersRef.current = {};
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      screenTrackRef.current?.stop();
+      localStreamRef.current = null;
+      cameraTrackRef.current = null;
+      screenTrackRef.current = null;
+      remoteVideoRefs.current = {};
+      setCallParticipants({});
+      setMicEnabled(true);
+      setCameraEnabled(true);
+      setScreenSharing(false);
+      setIncomingCall(null);
+      setCallState(nextState);
+      setStreamVersion((value) => value + 1);
+
+      if (activeCallId && notify) {
+        socket.emit("call-ended", { callId: activeCallId, threadId: activeThreadId, fromUid: currentUser?.uid });
+      }
+      if (activeCallId && activeThreadId) {
+        await writeCallData(activeThreadId, activeCallId, {
+          status: nextState,
+          endedBy: currentUser?.uid,
+          endedAt: serverTimestamp(),
+        });
+      }
+
+      callIdRef.current = null;
+      callThreadIdRef.current = null;
+      setCallId(null);
+      setCallThreadId(null);
+      window.setTimeout(() => setCallState(CallState.Idle), nextState === CallState.Ended ? 800 : 2200);
+    },
+    [currentUser?.uid, stopTone, writeCallData]
+  );
+
+  const ensureLocalMedia = useCallback(
+    async (mode: MediaMode) => {
+      if (localStreamRef.current) return localStreamRef.current;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedAudioDeviceId ? { deviceId: { exact: selectedAudioDeviceId } } : true,
+        video: mode === "video",
+      });
+      localStreamRef.current = stream;
+      cameraTrackRef.current = stream.getVideoTracks()[0] || null;
+      setMicEnabled(stream.getAudioTracks()[0]?.enabled ?? true);
+      setCameraEnabled(stream.getVideoTracks()[0]?.enabled ?? false);
+      setStreamVersion((value) => value + 1);
+      return stream;
+    },
+    [selectedAudioDeviceId]
+  );
+
+  const flushIceQueue = async (bundle: PeerBundle) => {
+    if (!bundle.peer.remoteDescription) return;
+    const queued = [...bundle.queuedIce];
+    bundle.queuedIce = [];
+    for (const candidate of queued) {
+      await bundle.peer.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => undefined);
+    }
+  };
+
+  const createPeer = useCallback(
+    async (targetUid: string, polite: boolean, mode: MediaMode) => {
+      if (!currentUser) throw new Error("Missing current user");
+      const stream = await ensureLocalMedia(mode);
+      const peer = new RTCPeerConnection(rtcConfiguration);
+      const remoteStream = new MediaStream();
+      const bundle: PeerBundle = { peer, remoteStream, queuedIce: [], polite, makingOffer: false, ignoreOffer: false };
+      peersRef.current[targetUid] = bundle;
+
+      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+
+      peer.ontrack = (event) => {
+        event.streams[0]?.getTracks().forEach((track) => {
+          if (!remoteStream.getTracks().some((item) => item.id === track.id)) remoteStream.addTrack(track);
+        });
+        upsertParticipant(targetUid, {
+          stream: remoteStream,
+          cameraEnabled: remoteStream.getVideoTracks().some((track) => track.enabled),
+          videoQuality: remoteStream.getVideoTracks().length ? "HD" : "Audio",
+        });
+        setStreamVersion((value) => value + 1);
+      };
+
+      peer.onicecandidate = (event) => {
+        if (!event.candidate || !callIdRef.current) return;
+        socket.emit("webrtc-ice-candidate", {
+          callId: callIdRef.current,
+          targetUid,
+          fromUid: currentUser.uid,
+          candidate: event.candidate.toJSON(),
+        });
+      };
+
+      peer.onnegotiationneeded = async () => {
+        try {
+          bundle.makingOffer = true;
+          await peer.setLocalDescription();
+          socket.emit("webrtc-offer", {
+            callId: callIdRef.current,
+            targetUid,
+            fromUid: currentUser.uid,
+            description: peer.localDescription,
+          });
+        } finally {
+          bundle.makingOffer = false;
+        }
+      };
+
+      peer.onconnectionstatechange = () => {
+        upsertParticipant(targetUid, { connectionState: peer.connectionState });
+        if (peer.connectionState === "connected") setCallState(CallState.Connected);
+        if (peer.connectionState === "disconnected") setCallState(CallState.Reconnecting);
+        if (peer.connectionState === "failed") void peer.restartIce();
+      };
+
+      return bundle;
+    },
+    [currentUser, ensureLocalMedia, upsertParticipant]
+  );
+
+  const handleRemoteDescription = useCallback(
+    async (fromUid: string, description: RTCSessionDescriptionInit, mode: MediaMode) => {
+      const bundle = peersRef.current[fromUid] || (await createPeer(fromUid, true, mode));
+      const offerCollision = description.type === "offer" && (bundle.makingOffer || bundle.peer.signalingState !== "stable");
+      bundle.ignoreOffer = !bundle.polite && offerCollision;
+      if (bundle.ignoreOffer) return;
+      await bundle.peer.setRemoteDescription(new RTCSessionDescription(description));
+      await flushIceQueue(bundle);
+      if (description.type === "offer") {
+        await bundle.peer.setLocalDescription();
+        socket.emit("webrtc-answer", {
+          callId: callIdRef.current,
+          targetUid: fromUid,
+          fromUid: currentUser?.uid,
+          description: bundle.peer.localDescription,
+        });
+      }
+    },
+    [createPeer, currentUser?.uid]
+  );
+
+  const updateMediaStatus = useCallback(() => {
+    if (!currentUser || !callIdRef.current) return;
+    socket.emit("media-status", {
+      callId: callIdRef.current,
+      fromUid: currentUser.uid,
+      micEnabled,
+      cameraEnabled,
+      screenSharing,
+    });
+  }, [cameraEnabled, currentUser, micEnabled, screenSharing]);
+
+  useEffect(() => updateMediaStatus(), [updateMediaStatus]);
+
+  useEffect(() => {
+    if (localVideoRef.current) localVideoRef.current.srcObject = localStreamRef.current;
+  }, [streamVersion, callState]);
+
+  useEffect(() => {
+    const firstRemote = Object.values(callParticipants).find((item) => item.stream)?.stream || null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = firstRemote;
+    Object.values(callParticipants).forEach((participant) => {
+      const element = remoteVideoRefs.current[participant.uid];
+      if (element && participant.stream) element.srcObject = participant.stream;
+    });
+  }, [callParticipants, streamVersion]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    if (registeredUidRef.current !== currentUser.uid) {
+      if (!socket.connected) socket.connect();
+      socket.emit("register-user", {
+        uid: currentUser.uid,
+        name: currentUser.name,
+        email: currentUser.email,
+      });
+      registeredUidRef.current = currentUser.uid;
+    }
+
+    const onPresence = (payload: { uid: string; online: boolean }) => {
+      setPresence((prev) => ({ ...prev, [payload.uid]: payload.online }));
+    };
+    const onPresenceSnapshot = (payload: Record<string, boolean>) => setPresence(payload || {});
+
+    socket.on("presence-update", onPresence);
+    socket.on("presence-snapshot", onPresenceSnapshot);
+    return () => {
+      socket.off("presence-update", onPresence);
+      socket.off("presence-snapshot", onPresenceSnapshot);
+    };
+  }, [currentUser]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -204,116 +551,193 @@ function ChatPage() {
         threadId: HR_BROADCAST_THREAD_ID,
         type: "broadcast",
         participants: ["all"],
-        lastMessage: "Broadcast channel ready",
-        timestamp: serverTimestamp(),
+        title: "HR Broadcast",
+        lastMessageAt: serverTimestamp(),
       },
       { merge: true }
     );
+
+    const q = query(collection(db, "chatThreads"), where("participants", "array-contains", currentUser.uid));
+    const unsub = onSnapshot(q, (snapshot) => {
+      setThreads(snapshot.docs.map((item) => ({ threadId: item.id, ...item.data() } as ChatThread)));
+    });
+    return () => unsub();
   }, [currentUser]);
 
   useEffect(() => {
-    if (!isHr) return;
+    messagesUnsubRef.current?.();
+    const q = query(collection(db, "chatThreads", activeThread.threadId, "messages"), orderBy("timestamp", "asc"));
+    messagesUnsubRef.current = onSnapshot(q, (snapshot) => {
+      setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() } as ChatMessage)));
+    });
+    if (currentUser && activeThread.threadId !== HR_BROADCAST_THREAD_ID) {
+      void setDoc(doc(db, "chatThreads", activeThread.threadId), { [`unreadBy.${currentUser.uid}`]: 0 }, { merge: true });
+    }
+    return () => {
+      messagesUnsubRef.current?.();
+      messagesUnsubRef.current = null;
+    };
+  }, [activeThread.threadId, currentUser]);
 
-    
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length, activeThread.threadId]);
 
+  useEffect(() => {
     const loadUsers = async () => {
       const found = new Map<string, ChatUser>();
       const addUser = (raw: any, fallbackId: string) => {
-        const email = normalizeEmail(raw.email);
         const uid = raw.uid || raw.userId || fallbackId;
+        const email = normalizeEmail(raw.email);
         if (!uid || !email) return;
         found.set(uid, {
           uid,
           email,
           name: raw.fullName || raw.name || email,
+          role: raw.role,
+          online: presence[uid],
         });
       };
-
       const [usersSnap, employeesSnap] = await Promise.all([
         getDocs(collection(db, "users")).catch(() => null),
         getDocs(collection(db, "employees")).catch(() => null),
       ]);
-
       usersSnap?.docs.forEach((item) => addUser(item.data(), item.id));
       employeesSnap?.docs.forEach((item) => addUser(item.data(), item.id));
-      setUsers(Array.from(found.values()).sort((a, b) => a.name.localeCompare(b.name)));
+      setUsers(Array.from(found.values()));
     };
-
     void loadUsers();
-  }, [isHr]);
+  }, [presence]);
+
+  useEffect(() => {
+    navigator.mediaDevices?.enumerateDevices?.().then((devices) => {
+      setAudioDevices(devices.filter((device) => device.kind === "audioinput"));
+    }).catch(() => undefined);
+  }, [streamVersion]);
 
   useEffect(() => {
     if (!currentUser) return;
 
-    const q = query(
-      collection(db, "chatThreads"),
-      where("participants", "array-contains", currentUser.uid)
-    );
+    const onIncomingCall = (payload: IncomingCall) => {
+      if (payload.callerUid === currentUser.uid || callState !== CallState.Idle) return;
+      setIncomingCall(payload);
+      setMediaMode(payload.mode);
+      setCallId(payload.callId);
+      setCallThreadId(payload.threadId);
+      callIdRef.current = payload.callId;
+      callThreadIdRef.current = payload.threadId;
+      setCallState(CallState.Ringing);
+      playTone(toneContextRef, stopToneRef);
+      missedTimerRef.current = window.setTimeout(() => {
+        socket.emit("call-missed", { callId: payload.callId, callerUid: payload.callerUid, targetUid: currentUser.uid, threadId: payload.threadId });
+        void addCallMessage(payload.threadId, "Missed call", payload.callId);
+        void cleanupCall(CallState.Missed, false);
+      }, MISSED_CALL_MS);
+    };
 
-    const unsub = onSnapshot(q, (snapshot) => {
-      const uniqueThreads = new Map<string, ChatThread>();
-      
-      snapshot.docs.forEach((docItem) => {
-        const threadData = docItem.data() as ChatThread;
-        uniqueThreads.set(docItem.id, { threadId: docItem.id, ...threadData });
-        
-        if (threadData.lastMessage === "Video call invite" && !isCallActive && activeCallRoom === null) {
-          const signalRef = doc(db, "chatThreads", docItem.id, "callData", "signal");
-          void getDoc(signalRef).then((snap) => {
-            if (snap.exists()) {
-              const data = snap.data();
-              if (data?.offer && !data?.answer && data?.createdBy !== currentUser.uid) {
-                setActiveCallRoom(docItem.id);
-                setActiveThread({
-                  threadId: docItem.id,
-                  type: "private",
-                  participants: threadData.participants,
-                  title: isHr ? (threadData.title || "Inbound Link") : "Private Chat with HR"
-                });
-              }
-            }
-          });
-        }
+    const onAccepted = async (payload: { callId: string; acceptedBy: string; acceptedByName: string; participantUids: string[]; mode: MediaMode }) => {
+      if (payload.callId !== callIdRef.current) return;
+      stopTone();
+      setCallState(CallState.Connecting);
+      upsertParticipant(payload.acceptedBy, { name: payload.acceptedByName, connectionState: "new" });
+      await createPeer(payload.acceptedBy, false, payload.mode);
+    };
+
+    const onRejected = (payload: { callId: string; rejectedByName?: string }) => {
+      if (payload.callId !== callIdRef.current) return;
+      void addCallMessage(callThreadIdRef.current || activeThread.threadId, `${payload.rejectedByName || "Participant"} rejected the call`, payload.callId);
+      void cleanupCall(CallState.Rejected, false);
+    };
+
+    const onMissed = (payload: { callId: string }) => {
+      if (payload.callId !== callIdRef.current) return;
+      void addCallMessage(callThreadIdRef.current || activeThread.threadId, "Missed call", payload.callId);
+      void cleanupCall(CallState.Missed, false);
+    };
+
+    const onParticipantJoined = async (payload: { callId: string; uid: string; name: string; mode: MediaMode }) => {
+      if (payload.callId !== callIdRef.current || payload.uid === currentUser.uid) return;
+      upsertParticipant(payload.uid, { name: payload.name });
+      await createPeer(payload.uid, currentUser.uid > payload.uid, payload.mode);
+    };
+
+    const onParticipantLeft = (payload: { callId: string; uid: string }) => {
+      if (payload.callId !== callIdRef.current) return;
+      peersRef.current[payload.uid]?.peer.close();
+      delete peersRef.current[payload.uid];
+      setCallParticipants((prev) => {
+        const next = { ...prev };
+        delete next[payload.uid];
+        return next;
       });
+    };
 
-      if (!isHr) {
-        setPrivateThreads(Array.from(uniqueThreads.values()).sort((a, b) => getMillis(b.timestamp) - getMillis(a.timestamp)));
+    const onOffer = (payload: { callId: string; fromUid: string; description: RTCSessionDescriptionInit; mode?: MediaMode }) => {
+      if (payload.callId !== callIdRef.current) return;
+      void handleRemoteDescription(payload.fromUid, payload.description, payload.mode || mediaMode);
+    };
+
+    const onAnswer = (payload: { callId: string; fromUid: string; description: RTCSessionDescriptionInit }) => {
+      if (payload.callId !== callIdRef.current) return;
+      void handleRemoteDescription(payload.fromUid, payload.description, mediaMode);
+    };
+
+    const onIce = (payload: { callId: string; fromUid: string; candidate: RTCIceCandidateInit }) => {
+      if (payload.callId !== callIdRef.current) return;
+      const bundle = peersRef.current[payload.fromUid];
+      if (!bundle || !bundle.peer.remoteDescription) {
+        if (bundle) bundle.queuedIce.push(payload.candidate);
+        return;
       }
-    });
+      void bundle.peer.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(() => undefined);
+    };
 
-    return () => unsub();
-  }, [currentUser, isHr, isCallActive, activeCallRoom]);
+    const onMediaStatus = (payload: { callId: string; fromUid: string; micEnabled: boolean; cameraEnabled: boolean; screenSharing: boolean }) => {
+      if (payload.callId !== callIdRef.current) return;
+      upsertParticipant(payload.fromUid, payload);
+    };
+
+    const onCallEnded = (payload: { callId: string }) => {
+      if (payload.callId !== callIdRef.current) return;
+      void cleanupCall(CallState.Ended, false);
+    };
+
+    socket.on("incoming-call", onIncomingCall);
+    socket.on("call-accepted", onAccepted);
+    socket.on("call-rejected", onRejected);
+    socket.on("call-missed", onMissed);
+    socket.on("participant-joined", onParticipantJoined);
+    socket.on("participant-left", onParticipantLeft);
+    socket.on("webrtc-offer", onOffer);
+    socket.on("webrtc-answer", onAnswer);
+    socket.on("webrtc-ice-candidate", onIce);
+    socket.on("media-status", onMediaStatus);
+    socket.on("call-ended", onCallEnded);
+
+    return () => {
+      socket.off("incoming-call", onIncomingCall);
+      socket.off("call-accepted", onAccepted);
+      socket.off("call-rejected", onRejected);
+      socket.off("call-missed", onMissed);
+      socket.off("participant-joined", onParticipantJoined);
+      socket.off("participant-left", onParticipantLeft);
+      socket.off("webrtc-offer", onOffer);
+      socket.off("webrtc-answer", onAnswer);
+      socket.off("webrtc-ice-candidate", onIce);
+      socket.off("media-status", onMediaStatus);
+      socket.off("call-ended", onCallEnded);
+    };
+  }, [activeThread.threadId, addCallMessage, callState, cleanupCall, createPeer, currentUser, handleRemoteDescription, mediaMode, stopTone, upsertParticipant]);
 
   useEffect(() => {
-    const q = query(
-      collection(db, "chatThreads", activeThread.threadId, "messages"),
-      orderBy("timestamp", "asc")
-    );
+    return () => {
+      void cleanupCall(CallState.Ended, true);
+      messagesUnsubRef.current?.();
+      if (typingTimerRef.current) window.clearTimeout(typingTimerRef.current);
+    };
+  }, [cleanupCall]);
 
-    const unsub = onSnapshot(q, (snapshot) => {
-      setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() } as ChatMessage)));
-    });
-
-    return () => unsub();
-  }, [activeThread.threadId]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, activeThread.threadId]);
-
-  const openBroadcast = async () => {
-    await setDoc(
-      doc(db, "chatThreads", HR_BROADCAST_THREAD_ID),
-      {
-        threadId: HR_BROADCAST_THREAD_ID,
-        type: "broadcast",
-        participants: ["all"],
-        lastMessage: "Broadcast channel ready",
-        timestamp: serverTimestamp(),
-      },
-      { merge: true }
-    );
-
+  const openBroadcast = () => {
     setActiveThread({
       threadId: HR_BROADCAST_THREAD_ID,
       type: "broadcast",
@@ -322,49 +746,55 @@ function ChatPage() {
     });
   };
 
-  const openHrPrivateThread = async (targetUser: ChatUser) => {
-    if (!currentUser || !isHr) return;
-
-    const threadId = makePrivateThreadId(currentUser.uid, targetUser.uid);
+  const openPrivateThread = async (targetUser: ChatUser) => {
+    if (!currentUser) return;
+    const threadId = getPrivateThreadId(currentUser.uid, targetUser.uid);
     const thread: ChatThread = {
       threadId,
       type: "private",
       participants: [currentUser.uid, targetUser.uid],
+      participantNames: { [currentUser.uid]: currentUser.name, [targetUser.uid]: targetUser.name },
+      participantEmails: { [currentUser.uid]: currentUser.email, [targetUser.uid]: targetUser.email },
       title: targetUser.name,
     };
-
     await setDoc(
       doc(db, "chatThreads", threadId),
       {
-        threadId,
-        type: "private",
-        participants: [currentUser.uid, targetUser.uid],
-        participantEmails: [currentUser.email, targetUser.email],
-        participantNames: {
-          [currentUser.uid]: currentUser.email,
-          [targetUser.uid]: targetUser.name,
-        },
+        ...thread,
         lastMessage: "Private chat opened",
+        lastMessageAt: serverTimestamp(),
         timestamp: serverTimestamp(),
       },
       { merge: true }
     );
-
     setActiveThread(thread);
   };
 
-  const openUserPrivateThread = (thread: ChatThread) => {
+  const openExistingThread = (thread: ChatThread) => {
     if (!currentUser || !thread.participants.includes(currentUser.uid)) return;
-    setActiveThread({ ...thread, title: "Private Chat with HR" });
+    const otherUid = thread.participants.find((uid) => uid !== currentUser.uid);
+    const otherName = otherUid ? thread.participantNames?.[otherUid] || users.find((item) => item.uid === otherUid)?.name : "Private chat";
+    setActiveThread({ ...thread, title: isHr ? otherName : "Private Chat with HR" });
+  };
+
+  const handleTyping = (value: string) => {
+    setMessageText(value);
+    if (!currentUser || activeThread.type !== "private") return;
+    if (typingTimerRef.current) window.clearTimeout(typingTimerRef.current);
+    void setDoc(doc(db, "chatThreads", activeThread.threadId), { [`typing.${currentUser.uid}`]: now() }, { merge: true });
+    typingTimerRef.current = window.setTimeout(() => {
+      void setDoc(doc(db, "chatThreads", activeThread.threadId), { [`typing.${currentUser.uid}`]: 0 }, { merge: true });
+    }, TYPING_TTL_MS);
   };
 
   const sendMessage = async (event: FormEvent) => {
     event.preventDefault();
     if (!currentUser || !messageText.trim()) return;
-    if (!isHr && activeThread.type === "private" && !activeThread.participants.includes(currentUser.uid)) return;
-
     const text = messageText.trim();
     setMessageText("");
+    const unreadBy = activeThread.participants
+      .filter((uid) => uid !== currentUser.uid && uid !== "all")
+      .reduce<Record<string, number>>((acc, uid) => ({ ...acc, [uid]: (activeThread.unreadBy?.[uid] || 0) + 1 }), {});
 
     await addDoc(collection(db, "chatThreads", activeThread.threadId, "messages"), {
       senderId: currentUser.uid,
@@ -373,718 +803,390 @@ function ChatPage() {
       type: "text",
       timestamp: serverTimestamp(),
     });
-
     await setDoc(
       doc(db, "chatThreads", activeThread.threadId),
       {
         threadId: activeThread.threadId,
         type: activeThread.type,
-        participants: activeThread.type === "broadcast" ? ["all"] : activeThread.participants,
+        participants: activeThread.participants,
         lastMessage: text,
-        timestamp: serverTimestamp(),
+        lastMessageAt: serverTimestamp(),
+        unreadBy,
+        [`typing.${currentUser.uid}`]: 0,
       },
       { merge: true }
     );
   };
 
   const deleteMessage = async (message: ChatMessage) => {
-    if (!currentUser || message.senderId !== currentUser.uid || !message.id) return;
-    await deleteDoc(doc(db, "chatThreads", activeThread.threadId, "messages", message.id));
+    if (!currentUser || message.senderId !== currentUser.uid) return;
+    await updateDoc(doc(db, "chatThreads", activeThread.threadId, "messages", message.id), {
+      deleted: true,
+      text: "This message was deleted",
+    }).catch(() => deleteDoc(doc(db, "chatThreads", activeThread.threadId, "messages", message.id)));
   };
 
-  const clearCallListeners = () => {
-    callUnsubs.current.forEach((unsub) => unsub());
-    callUnsubs.current = [];
-  };
-
-  const getInitials = (value?: string) => {
-    return (value || "User")
-      .split(/[\s@._-]+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((part) => part.charAt(0).toUpperCase())
-      .join("");
-  };
-
-  const formatMessageDateAndHour = (timestamp: any) => {
-    if (!timestamp) return "Sending...";
-    const date = timestamp.toMillis ? new Date(timestamp.toMillis()) : new Date(timestamp);
-    return date.toLocaleString([], {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: true
+  const startCall = async (mode: MediaMode) => {
+    if (!currentUser || activeThread.type !== "private") return;
+    const targetUids = activeThread.participants.filter((uid) => uid !== currentUser.uid);
+    if (!targetUids.length) return;
+    const id = `call_${currentUser.uid}_${Date.now()}`;
+    setCallId(id);
+    setCallThreadId(activeThread.threadId);
+    setMediaMode(mode);
+    setCallState(CallState.Calling);
+    callIdRef.current = id;
+    callThreadIdRef.current = activeThread.threadId;
+    playTone(toneContextRef, stopToneRef);
+    await ensureLocalMedia(mode);
+    await writeCallData(activeThread.threadId, id, {
+      status: CallState.Calling,
+      callerUid: currentUser.uid,
+      participantUids: activeThread.participants,
+      mode,
+      createdAt: serverTimestamp(),
     });
+    await addCallMessage(activeThread.threadId, `${mode === "video" ? "Video" : "Audio"} call started`, id);
+    socket.emit("call-user", {
+      callId: id,
+      threadId: activeThread.threadId,
+      callerUid: currentUser.uid,
+      callerName: currentUser.name,
+      callerEmail: currentUser.email,
+      participantUids: activeThread.participants,
+      targetUids,
+      mode,
+    });
+    missedTimerRef.current = window.setTimeout(() => {
+      socket.emit("cancel-call", { callId: id, threadId: activeThread.threadId, targetUids, callerUid: currentUser.uid });
+      void addCallMessage(activeThread.threadId, "Missed call", id);
+      void cleanupCall(CallState.Missed, false);
+    }, MISSED_CALL_MS);
   };
 
-  const flushQueuedIceCandidates = async () => {
-    if (!pc.current || !remoteDescriptionReady.current || !pc.current.currentRemoteDescription) return;
-    const queued = [...iceCandidatesQueue.current];
-    iceCandidatesQueue.current = [];
-
-    for (const candidate of queued) {
-      try {
-        await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.warn("ICE candidate skipped safely:", err);
-      }
-    }
+  const acceptCall = async () => {
+    if (!incomingCall || !currentUser) return;
+    if (missedTimerRef.current) window.clearTimeout(missedTimerRef.current);
+    missedTimerRef.current = null;
+    stopTone();
+    setCallState(CallState.Connecting);
+    await ensureLocalMedia(incomingCall.mode);
+    await writeCallData(incomingCall.threadId, incomingCall.callId, {
+      status: CallState.Connecting,
+      acceptedBy: currentUser.uid,
+      acceptedAt: serverTimestamp(),
+    });
+    socket.emit("answer-call", {
+      callId: incomingCall.callId,
+      threadId: incomingCall.threadId,
+      callerUid: incomingCall.callerUid,
+      acceptedBy: currentUser.uid,
+      acceptedByName: currentUser.name,
+      participantUids: incomingCall.participantUids,
+      mode: incomingCall.mode,
+    });
+    setIncomingCall(null);
   };
 
-  const addRemoteCandidate = async (candidate: RTCIceCandidateInit) => {
-    if (!pc.current) return;
-    if (!remoteDescriptionReady.current || !pc.current.currentRemoteDescription) {
-      iceCandidatesQueue.current.push(candidate);
+  const rejectCall = async () => {
+    if (!incomingCall || !currentUser) return;
+    socket.emit("reject-call", {
+      callId: incomingCall.callId,
+      callerUid: incomingCall.callerUid,
+      rejectedBy: currentUser.uid,
+      rejectedByName: currentUser.name,
+      threadId: incomingCall.threadId,
+    });
+    await addCallMessage(incomingCall.threadId, "Call rejected", incomingCall.callId);
+    await cleanupCall(CallState.Rejected, false);
+  };
+
+  const toggleMic = () => {
+    const track = localStreamRef.current?.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setMicEnabled(track.enabled);
+  };
+
+  const toggleCamera = async () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      track.enabled = !track.enabled;
+      setCameraEnabled(track.enabled);
+      setStreamVersion((value) => value + 1);
       return;
     }
-    try {
-      await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (err) {
-      console.warn("Skipped route candidate configuration:", err);
-    }
+    const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    const cameraTrack = cameraStream.getVideoTracks()[0];
+    if (!cameraTrack) return;
+    cameraTrackRef.current = cameraTrack;
+    stream.addTrack(cameraTrack);
+    await Promise.all(Object.values(peersRef.current).map(({ peer }) => peer.addTrack(cameraTrack, stream)));
+    setCameraEnabled(true);
+    setStreamVersion((value) => value + 1);
   };
 
-  const preparePeerConnection = async (threadId: string, role: "caller" | "callee") => {
-    await endCall(false);
-    setActiveCallRoom(threadId);
-    setIsCallActive(true);
-    iceCandidatesQueue.current = [];
-    remoteDescriptionReady.current = false;
-
-    const peer = new RTCPeerConnection(configuration);
-    const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    const remoteStream = new MediaStream();
-
-    cameraTrackRef.current = localStream.getVideoTracks()[0] || null;
-    localStream.getTracks().forEach((track) => peer.addTrack(track, localStream));
-    
-    peer.ontrack = (event) => {
-      console.log("Remote Track:", event.track.kind);
-      const inboundStream = event.streams?.[0] || remoteStream;
-      if (!event.streams?.[0] && event.track && !inboundStream.getTracks().some((track) => track.id === event.track.id)) {
-        inboundStream.addTrack(event.track);
-      }
-
-      remoteStreamRef.current = inboundStream;
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = inboundStream;
-      }
-      if (event.track.kind === "video") {
-        setRemoteVideoEnabled(true);
-      }
-      setStreamVersion((version) => version + 1);
-    };
-
-    pc.current = peer;
-    localStreamRef.current = localStream;
-    remoteStreamRef.current = remoteStream;
-    setMicEnabled(localStream.getAudioTracks()[0]?.enabled ?? true);
-    setCameraEnabled(cameraTrackRef.current?.enabled ?? false);
-    setLocalVideoEnabled(cameraTrackRef.current?.enabled ?? false);
-    setRemoteVideoEnabled(false);
-    setScreenSharing(false);
-    setIsCallActive(true);
-    setStreamVersion((version) => version + 1);
-
-    const signalRef = doc(db, "chatThreads", threadId, "callData", "signal");
-    const offerCandidatesRef = collection(
-      db,
-      "chatThreads",
-      threadId,
-      "callData",
-      "signal",
-      "offerCandidates"
+  const replaceOutboundVideo = async (track: MediaStreamTrack | null) => {
+    await Promise.all(
+      Object.values(peersRef.current).map(async ({ peer }) => {
+        const sender = peer.getSenders().find((item) => item.track?.kind === "video");
+        if (sender) await sender.replaceTrack(track);
+      })
     );
-    const answerCandidatesRef = collection(
-      db,
-      "chatThreads",
-      threadId,
-      "callData",
-      "signal",
-      "answerCandidates"
-    );
-
-    peer.onicecandidate = async (event) => {
-      if (!event.candidate) return;
-      await addDoc(role === "caller" ? offerCandidatesRef : answerCandidatesRef, event.candidate.toJSON());
-    };
-
-    peer.oniceconnectionstatechange = () => {
-      if (peer.iceConnectionState === "failed") {
-        peer.restartIce?.();
-      }
-    };
-
-    return { peer, signalRef, offerCandidatesRef, answerCandidatesRef };
-  };
-// start call()
-  const startCall = async () => {
-  console.log("START CALL CLICKED");
-
-  if (!currentUser) return;
-
-  if (activeThread.threadId === "hr_broadcast") {
-    alert("Video/Audio calls are only allowed in private chats.");
-    return;
-  }
-
-  const threadId = activeThread.threadId;
-
-  console.log("Thread:", activeThread);
-
-  const { peer, signalRef, answerCandidatesRef } =
-    await preparePeerConnection(threadId, "caller");
-
-  const offer = await peer.createOffer();
-
-  await peer.setLocalDescription(offer);
-
-  await setDoc(
-    signalRef,
-    {
-      offer: {
-        type: offer.type,
-        sdp: offer.sdp,
-      },
-      answer: null,
-      roomName: threadId,
-      createdBy: currentUser.uid,
-      timestamp: serverTimestamp(),
-    },
-    { merge: true }
-  );
-
-  callUnsubs.current.push(
-    onSnapshot(signalRef, async (snapshot) => {
-      const answer = snapshot.data()?.answer;
-
-      if (answer && !peer.currentRemoteDescription) {
-        await peer.setRemoteDescription(
-          new RTCSessionDescription(answer)
-        );
-
-        remoteDescriptionReady.current = true;
-
-        await flushQueuedIceCandidates();
-      }
-    }),
-
-    onSnapshot(answerCandidatesRef, (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === "added") {
-          addRemoteCandidate(
-            change.doc.data()
-          ).catch(console.error);
-        }
-      });
-    })
-  );
-
-  await addDoc(
-    collection(
-      db,
-      "chatThreads",
-      threadId,
-      "messages"
-    ),
-    {
-      senderId: currentUser.uid,
-      senderEmail: currentUser.email,
-      text: "Video call invite",
-      type: "call_invite",
-      roomName: threadId,
-      timestamp: serverTimestamp(),
-    }
-  );
-
-  await setDoc(
-    doc(db, "chatThreads", threadId),
-    {
-      threadId,
-      type: activeThread.type,
-      participants:
-        activeThread.type === "broadcast"
-          ? ["all"]
-          : activeThread.participants,
-      lastMessage: "Video call invite",
-      timestamp: serverTimestamp(),
-    },
-    { merge: true }
-  );
-};
-
-
-// join call 
-
- const joinCall = async (roomName: string) => {
-  console.log("Joining Room:", roomName);
-
-  setActiveCallRoom(roomName);
-  setIsCallActive(true);
-
-  const { peer, signalRef, offerCandidatesRef } =
-    await preparePeerConnection(
-      roomName,
-      "callee"
-    );
-
-  const signalSnap = await getDoc(signalRef);
-
-  const offer = signalSnap.data()?.offer;
-
-  if (!offer) {
-    console.error("Offer not found");
-    return;
-  }
-
-  await peer.setRemoteDescription(
-    new RTCSessionDescription(offer)
-  );
-
-  remoteDescriptionReady.current = true;
-
-  await flushQueuedIceCandidates();
-
-  const answer = await peer.createAnswer();
-
-  await peer.setLocalDescription(answer);
-
-  await setDoc(
-    signalRef,
-    {
-      answer: {
-        type: answer.type,
-        sdp: answer.sdp,
-      },
-      answeredAt: serverTimestamp(),
-    },
-    { merge: true }
-  );
-
-  callUnsubs.current.push(
-    onSnapshot(offerCandidatesRef, (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === "added") {
-          addRemoteCandidate(
-            change.doc.data()
-          ).catch(console.error);
-        }
-      });
-    })
-  );
-};
-
-  const toggleMicrophone = () => {
-    const audioTrack = localStreamRef.current?.getAudioTracks()[0];
-    if (!audioTrack) return;
-    audioTrack.enabled = !audioTrack.enabled;
-    setMicEnabled(audioTrack.enabled);
-  };
-
-  const toggleCamera = () => {
-    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
-    if (!videoTrack) return;
-    videoTrack.enabled = !videoTrack.enabled;
-    setCameraEnabled(videoTrack.enabled);
-    setLocalVideoEnabled(videoTrack.enabled);
-  };
-
-  const replaceOutboundVideoTrack = async (track: MediaStreamTrack | null) => {
-    const sender = pc.current?.getSenders().find((item) => item.track?.kind === "video");
-    if (sender) await sender.replaceTrack(track);
   };
 
   const startScreenShare = async () => {
-    if (!pc.current || !localStreamRef.current) return;
-    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    if (!localStreamRef.current || screenSharing) return;
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
     const screenTrack = displayStream.getVideoTracks()[0];
-    const cameraTrack = cameraTrackRef.current;
     if (!screenTrack) return;
-
     screenTrackRef.current = screenTrack;
-    await replaceOutboundVideoTrack(screenTrack);
-    localStreamRef.current = new MediaStream([screenTrack, ...localStreamRef.current.getAudioTracks()]);
+    await replaceOutboundVideo(screenTrack);
     setScreenSharing(true);
     setCameraEnabled(true);
-    setLocalVideoEnabled(true);
-    setStreamVersion((version) => version + 1);
-
+    setStreamVersion((value) => value + 1);
     screenTrack.onended = async () => {
-      await replaceOutboundVideoTrack(cameraTrack);
+      await replaceOutboundVideo(cameraTrackRef.current);
       screenTrackRef.current = null;
       setScreenSharing(false);
-      if (cameraTrack && localStreamRef.current) {
-        localStreamRef.current = new MediaStream([cameraTrack, ...localStreamRef.current.getAudioTracks()]);
-        setCameraEnabled(cameraTrack.enabled);
-        setLocalVideoEnabled(cameraTrack.enabled);
-        setStreamVersion((version) => version + 1);
-      }
+      setCameraEnabled(cameraTrackRef.current?.enabled ?? false);
+      setStreamVersion((value) => value + 1);
     };
   };
 
-  const endCall = async (clearSignal = true) => {
-    clearCallListeners();
-    pc.current?.close();
-    pc.current = null;
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
-    remoteStreamRef.current?.getTracks().forEach((track) => track.stop());
-    screenTrackRef.current?.stop();
-    localStreamRef.current = null;
-    remoteStreamRef.current = null;
-    cameraTrackRef.current = null;
-    screenTrackRef.current = null;
-    iceCandidatesQueue.current = [];
-    remoteDescriptionReady.current = false;
+  const switchAudioDevice = async (deviceId: string) => {
+    setSelectedAudioDeviceId(deviceId);
+    if (!localStreamRef.current) return;
+    const newStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } }, video: false });
+    const newTrack = newStream.getAudioTracks()[0];
+    if (!newTrack) return;
+    localStreamRef.current.getAudioTracks().forEach((track) => {
+      track.stop();
+      localStreamRef.current?.removeTrack(track);
+    });
+    localStreamRef.current.addTrack(newTrack);
+    await Promise.all(
+      Object.values(peersRef.current).map(async ({ peer }) => {
+        const sender = peer.getSenders().find((item) => item.track?.kind === "audio");
+        if (sender) await sender.replaceTrack(newTrack);
+      })
+    );
     setMicEnabled(true);
-    setCameraEnabled(true);
-    setLocalVideoEnabled(false);
-    setRemoteVideoEnabled(false);
-    setScreenSharing(false);
-    setIsCallActive(false);
-    setActiveCallRoom(null);
-    setStreamVersion((version) => version + 1);
-
-    if (!clearSignal) return;
-
-    const signalRef = doc(db, "chatThreads", activeThread.threadId, "callData", "signal");
-    const offerCandidatesRef = collection(
-      db,
-      "chatThreads",
-      activeThread.threadId,
-      "callData",
-      "signal",
-      "offerCandidates"
-    );
-    const answerCandidatesRef = collection(
-      db,
-      "chatThreads",
-      activeThread.threadId,
-      "callData",
-      "signal",
-      "answerCandidates"
-    );
-    const [offerCandidates, answerCandidates] = await Promise.all([
-      getDocs(offerCandidatesRef).catch(() => null),
-      getDocs(answerCandidatesRef).catch(() => null),
-    ]);
-
-    await Promise.all([
-      ...(offerCandidates?.docs.map((item) => deleteDoc(item.ref)) || []),
-      ...(answerCandidates?.docs.map((item) => deleteDoc(item.ref)) || []),
-      deleteDoc(signalRef).catch(() => undefined),
-    ]);
   };
 
-  {/* UPGRADED CALL HANDLING MODULE: Intercepts active ringing state on incoming invitations so callee can lift or drop calls */}
-  if (activeCallRoom && !isCallActive) {
-    return (
-      <div className="h-[calc(100vh-48px)] w-full bg-[#1e1f22] rounded-xl flex flex-col items-center justify-center text-white p-6 space-y-6 shadow-2xl relative overflow-hidden">
-        <div className="relative flex items-center justify-center">
-          <div className="w-20 h-20 rounded-full bg-[#464775] flex items-center justify-center text-2xl font-bold border-2 border-white/10 animate-bounce">
-            {getInitials(activeThread.title)}
-          </div>
-          <div className="absolute w-24 h-24 border-2 border-blue-500 rounded-full animate-ping pointer-events-none" />
-        </div>
-        <div className="text-center space-y-1">
-          <h3 className="text-md font-bold tracking-wide text-slate-200">{activeThread.title}</h3>
-          <p className="text-xs text-blue-400 font-bold uppercase tracking-widest animate-pulse">Incoming Call...</p>
-        </div>
-        <div className="flex items-center gap-4 pt-2">
-          <button 
-            type="button"
-            onClick={() => void joinCall(activeCallRoom)}
-            className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-lg shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition-all"
-          >
-            Accept Call
-          </button>
-          <button 
-            type="button"
-            onClick={() => void endCall(true)}
-            className="px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-lg shadow-lg shadow-red-900/30 flex items-center gap-2 transition-all"
-          >
-            Decline
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (isCallActive || activeCallRoom) {
-    return (
-      <div className="relative h-[calc(100vh-48px)] overflow-hidden rounded-lg bg-[#1f1f1f]">
-        <div className="flex h-full items-center justify-center p-6 pb-28">
-          <div className="relative flex aspect-video w-full max-w-6xl items-center justify-center overflow-hidden rounded-lg bg-neutral-900 shadow-2xl">
-            {/* FIXED BUG: Keeping element explicitly mounted in DOM to guarantee WebRTC streams bind to refs immediately */}
-            <video 
-              ref={remoteVideoRef} 
-              autoPlay 
-              playsInline 
-              className={`h-full w-full object-cover ${remoteVideoEnabled ? "block" : "hidden"}`} 
-            />
-            {!remoteVideoEnabled && (
-              <div className="flex h-32 w-32 items-center justify-center rounded-full bg-blue-700 text-4xl font-bold text-white">
-                {getInitials(activeThread.title || activeCallRoom || "Remote User")}
-              </div>
-            )}
-            <div className="absolute left-4 top-4 rounded bg-black/60 px-3 py-1 text-xs font-medium text-white">
-              Remote
-            </div>
-          </div>
-        </div>
-
-        <div className="absolute bottom-6 right-6 z-10 w-52 scale-x-[-1] overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl">
-          <div className="aspect-video relative">
-            {/* FIXED BUG: Keeping element explicitly mounted in DOM to guarantee WebRTC streams bind to refs immediately */}
-            <video 
-              ref={localVideoRef} 
-              autoPlay 
-              playsInline 
-              muted 
-              className={`h-full w-full object-cover ${localVideoEnabled ? "block" : "hidden"}`} 
-            />
-            {!localVideoEnabled && (
-              <div className="flex h-full w-full scale-x-[-1] items-center justify-center bg-neutral-800 absolute inset-0">
-                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-700 text-lg font-bold text-white">
-                  {getInitials(currentUser?.name)}
-                </div>
-              </div>
-            )}
-          </div>
-          <div className="absolute left-2 top-2 scale-x-[-1] rounded bg-black/60 px-2 py-0.5 text-xs text-white">
-            You
-          </div>
-        </div>
-
-        <div className="absolute bottom-8 left-1/2 z-20 flex -translate-x-1/2 items-center gap-5 rounded-full border border-neutral-800 bg-neutral-900/90 px-7 py-4 shadow-2xl backdrop-blur-md">
-          <button
-            type="button"
-            onClick={toggleMicrophone}
-            className={`flex h-11 w-11 items-center justify-center rounded-full border text-white ${
-              micEnabled ? "border-neutral-700 bg-neutral-800 hover:bg-neutral-700" : "border-red-500 bg-red-600 hover:bg-red-700"
-            }`}
-            title={micEnabled ? "Mute microphone" : "Unmute microphone"}
-          >
-            {micEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
-          </button>
-          <button
-            type="button"
-            onClick={toggleCamera}
-            className={`flex h-11 w-11 items-center justify-center rounded-full border text-white ${
-              cameraEnabled ? "border-neutral-700 bg-neutral-800 hover:bg-neutral-700" : "border-red-500 bg-red-600 hover:bg-red-700"
-            }`}
-            title={cameraEnabled ? "Turn camera off" : "Turn camera on"}
-          >
-            {cameraEnabled ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
-          </button>
-          <button
-            type="button"
-            onClick={startScreenShare}
-            className={`flex h-11 w-11 items-center justify-center rounded-full border text-white ${
-              screenSharing ? "border-blue-500 bg-blue-600" : "border-neutral-700 bg-neutral-800 hover:bg-neutral-700"
-            }`}
-            title="Share screen"
-          >
-            <MonitorUp className="h-5 w-5" />
-          </button>
-          <button
-            type="button"
-            onClick={() => void endCall()}
-            className="flex h-12 w-12 items-center justify-center rounded-full bg-red-600 text-white shadow-lg hover:bg-red-700"
-            title="End call"
-          >
-            <PhoneOff className="h-5 w-5" />
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const participantCards = Object.values(callParticipants);
 
   return (
-    <div className="h-[calc(100vh-48px)] overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
-      <div className="grid h-full grid-cols-1 md:grid-cols-[320px_1fr]">
-        <aside className="min-h-0 overflow-y-auto border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950">
-          <div className="border-b border-slate-200 p-4 dark:border-slate-700">
-            <h1 className="text-lg font-semibold text-slate-900 dark:text-white">Chat</h1>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              {isHr ? "Broadcasts and private user threads" : "HR broadcast and your HR thread"}
-            </p>
+    <div className="h-[calc(100vh-48px)] overflow-hidden rounded-lg border border-slate-200 bg-[#f5f5f5] text-slate-900 shadow-sm dark:border-slate-800 dark:bg-[#1f1f1f] dark:text-white">
+      <div className="grid h-full grid-cols-1 md:grid-cols-[76px_300px_minmax(0,1fr)]">
+        <nav className="hidden border-r border-slate-200 bg-[#ebebeb] p-3 dark:border-neutral-800 dark:bg-[#181818] md:flex md:flex-col md:items-center md:gap-4">
+          <button className="flex h-11 w-11 items-center justify-center rounded-md bg-[#6264a7] text-white" title="Chat">
+            <Users className="h-5 w-5" />
+          </button>
+          <button className="flex h-11 w-11 items-center justify-center rounded-md text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-neutral-800" title="Activity">
+            <Activity className="h-5 w-5" />
+          </button>
+          <button className="flex h-11 w-11 items-center justify-center rounded-md text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-neutral-800" title="Calls">
+            <PhoneCall className="h-5 w-5" />
+          </button>
+        </nav>
+
+        <aside className="min-h-0 overflow-y-auto border-r border-slate-200 bg-white dark:border-neutral-800 dark:bg-[#242424]">
+          <div className="border-b border-slate-200 p-4 dark:border-neutral-800">
+            <div className="flex items-center justify-between">
+              <h1 className="text-xl font-semibold">Chat</h1>
+              <MoreVertical className="h-5 w-5 text-slate-500" />
+            </div>
+            <label className="mt-3 flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-neutral-700 dark:bg-[#1f1f1f]">
+              <Search className="h-4 w-4 text-slate-500" />
+              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search" className="min-w-0 flex-1 bg-transparent outline-none" />
+            </label>
           </div>
 
-          <div className="space-y-2 p-3">
+          <div className="p-3">
             <button
               type="button"
-              onClick={() => void openBroadcast()}
-              className={`w-full rounded-md px-3 py-2 text-left text-sm ${
-                activeThread.threadId === HR_BROADCAST_THREAD_ID
-                  ? "bg-blue-600 text-white"
-                  : "bg-white text-slate-800 hover:bg-blue-50 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
-              }`}
+              onClick={openBroadcast}
+              className={`mb-2 w-full rounded-md px-3 py-3 text-left text-sm ${activeThread.threadId === HR_BROADCAST_THREAD_ID ? "bg-[#e8e8ff] text-[#464775] dark:bg-[#34345c] dark:text-white" : "hover:bg-slate-100 dark:hover:bg-neutral-800"}`}
             >
-              <div className="font-medium">HR Broadcast</div>
-              <div className="text-xs opacity-75">Visible to every standard user</div>
+              <div className="flex items-center gap-3">
+                <span className="flex h-9 w-9 items-center justify-center rounded bg-[#464775] text-sm font-semibold text-white">
+                  <Radio className="h-4 w-4" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block font-semibold">HR Broadcast</span>
+                  <span className="block truncate text-xs opacity-70">Announcements for everyone</span>
+                </span>
+              </div>
             </button>
 
+            <div className="mb-2 mt-4 px-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Private chats</div>
             {isHr ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void openBroadcast()}
-                  className="flex w-full items-center justify-center gap-2 rounded-md bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
-                >
-                  <Users className="h-4 w-4" />
-                  Broadcast to All Users
-                </button>
-                <input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search by name or ID..."
-                  className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-                />
-                {filteredUsers.map((item) => (
-                  <button
-                    key={item.uid}
-                    type="button"
-                    onClick={() => void openHrPrivateThread(item)}
-                    className="w-full rounded-md bg-white px-3 py-2 text-left text-sm text-slate-800 hover:bg-blue-50 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
-                  >
-                    <div className="truncate font-medium">{item.name}</div>
-                    <div className="truncate text-xs text-slate-500">{item.uid}</div>
-                  </button>
-                ))}
-              </>
-            ) : (
-              <>
-                <div className="pt-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  Private HR chat
-                </div>
-                {visiblePrivateThreads.length === 0 ? (
-                  <div className="rounded-md bg-white p-3 text-sm text-slate-500 dark:bg-slate-900 dark:text-slate-400">
-                    HR has not opened a private chat with you yet.
+              filteredUsers.map((item) => (
+                <button key={item.uid} type="button" onClick={() => void openPrivateThread(item)} className="w-full rounded-md px-3 py-2 text-left hover:bg-slate-100 dark:hover:bg-neutral-800">
+                  <div className="flex items-center gap-3">
+                    <span className="relative flex h-9 w-9 items-center justify-center rounded bg-[#0b6a6f] text-sm font-semibold text-white">
+                      {getInitials(item.name)}
+                      <Circle className={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full ${item.online ? "fill-emerald-500 text-emerald-500" : "fill-slate-400 text-slate-400"}`} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium">{item.name}</span>
+                      <span className="block truncate text-xs text-slate-500">{item.online ? "Available" : item.email}</span>
+                    </span>
                   </div>
-                ) : (
-                  visiblePrivateThreads.map((thread) => (
-                    <button
-                      key={thread.threadId}
-                      type="button"
-                      onClick={() => openUserPrivateThread(thread)}
-                      className={`w-full rounded-md px-3 py-2 text-left text-sm ${
-                        activeThread.threadId === thread.threadId
-                          ? "bg-blue-600 text-white"
-                          : "bg-white text-slate-800 hover:bg-blue-50 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
-                      }`}
-                    >
-                      <div className="font-medium">Private Chat with HR</div>
-                      <div className="truncate text-xs opacity-75">{thread.lastMessage || "Open conversation"}</div>
-                    </button>
-                  ))
-                )}
-              </>
+                </button>
+              ))
+            ) : privateThreads.length ? (
+              privateThreads.map((thread) => {
+                const unread = currentUser ? thread.unreadBy?.[currentUser.uid] || 0 : 0;
+                return (
+                  <button key={thread.threadId} type="button" onClick={() => openExistingThread(thread)} className={`w-full rounded-md px-3 py-2 text-left ${activeThread.threadId === thread.threadId ? "bg-[#e8e8ff] dark:bg-[#34345c]" : "hover:bg-slate-100 dark:hover:bg-neutral-800"}`}>
+                    <div className="flex items-center gap-3">
+                      <span className="flex h-9 w-9 items-center justify-center rounded bg-[#8764b8] text-sm font-semibold text-white">HR</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">Private Chat with HR</span>
+                        <span className="block truncate text-xs text-slate-500">{thread.lastMessage || "Open conversation"}</span>
+                      </span>
+                      {unread > 0 && <span className="rounded-full bg-[#6264a7] px-2 py-0.5 text-xs font-semibold text-white">{unread}</span>}
+                    </div>
+                  </button>
+                );
+              })
+            ) : (
+              <div className="rounded-md bg-slate-50 p-3 text-sm text-slate-500 dark:bg-neutral-800">HR has not opened a private chat yet.</div>
             )}
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col">
-          <header className="flex items-center justify-between gap-3 border-b border-slate-200 p-4 dark:border-slate-700">
-            <div>
-              <h2 className="font-semibold text-slate-900 dark:text-white">{activeThread.title}</h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {activeThread.type === "broadcast" ? "Broadcast thread" : "Private 1-on-1 thread"}
+        <main className="flex min-h-0 flex-col bg-white dark:bg-[#1f1f1f]">
+          <header className="flex items-center justify-between border-b border-slate-200 px-5 py-3 dark:border-neutral-800">
+            <div className="min-w-0">
+              <h2 className="truncate text-lg font-semibold">{activeThread.title || "Conversation"}</h2>
+              <p className="flex items-center gap-2 text-xs text-slate-500">
+                {activeThread.type === "broadcast" ? "Broadcast channel" : "Private chat"}
+                {activeThread.type === "private" && <span className="inline-flex items-center gap-1">{presence[activeThread.participants.find((uid) => uid !== currentUser?.uid) || ""] ? <Wifi className="h-3 w-3 text-emerald-500" /> : <WifiOff className="h-3 w-3" />} presence</span>}
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void startCall()}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-blue-900"
-                title="Start video call"
-              >
-                <Video className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => void startCall()}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-slate-100 text-slate-700 hover:bg-green-100 hover:text-green-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-green-900"
-                title="Start audio call"
-              >
+              <button type="button" disabled={!canCall} onClick={() => void startCall("audio")} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-700 hover:bg-slate-100 disabled:opacity-40 dark:text-slate-200 dark:hover:bg-neutral-800" title="Start audio call">
                 <Phone className="h-4 w-4" />
+              </button>
+              <button type="button" disabled={!canCall} onClick={() => void startCall("video")} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-700 hover:bg-slate-100 disabled:opacity-40 dark:text-slate-200 dark:hover:bg-neutral-800" title="Start video call">
+                <Camera className="h-4 w-4" />
               </button>
             </div>
           </header>
 
-          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-slate-50 p-4 dark:bg-slate-950">
+          <section className="min-h-0 flex-1 overflow-y-auto bg-[#fafafa] p-5 dark:bg-[#191919]">
             {messages.length === 0 ? (
-              <div className="flex h-full items-center justify-center text-sm text-slate-500">
-                No messages yet.
-              </div>
+              <div className="flex h-full items-center justify-center text-sm text-slate-500">No messages yet.</div>
             ) : (
-              visibleMessages.map((message) => {
+              messages.map((message) => {
                 const mine = message.senderId === currentUser?.uid;
-                const callRoomName = message.roomName;
                 return (
-                  <div key={message.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-                    <div
-                      className={`group relative max-w-[75%] rounded-lg px-4 py-2 text-sm ${
-                        mine ? "bg-blue-600 text-white" : "bg-white text-slate-900 dark:bg-slate-800 dark:text-white"
-                      }`}
-                    >
-                      {mine && (
-                        <button
-                          type="button"
-                          onClick={() => void deleteMessage(message)}
-                          className="absolute -left-8 top-1/2 hidden h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 hover:bg-red-50 hover:text-red-600 group-hover:flex dark:hover:bg-red-950/40"
-                          title="Delete message"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                      {!mine && <div className="mb-1 text-xs opacity-70">{message.senderEmail || "HR"}</div>}
-                      <div className="whitespace-pre-wrap break-words">{message.text}</div>
-                      
-                      <span className={`text-[9px] block text-right mt-1 opacity-60 ${mine ? "text-blue-100" : "text-slate-400"}`}>
-                        {formatMessageDateAndHour(message.timestamp)}
-                      </span>
-
-                      {message.type === "call_invite" && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (callRoomName) void joinCall(callRoomName);
-                          }}
-                          disabled={!callRoomName}
-                          className={`mt-3 rounded-md px-3 py-1.5 text-xs font-semibold ${
-                            mine ? "bg-white text-blue-700" : "bg-blue-600 text-white hover:bg-blue-700"
-                          } disabled:cursor-not-allowed disabled:opacity-60`}
-                        >
-                          Join Meeting
-                        </button>
-                      )}
+                  <div key={message.id} className={`mb-3 flex ${mine ? "justify-end" : "justify-start"}`}>
+                    <div className={`group max-w-[78%] rounded-md px-3 py-2 text-sm shadow-sm ${mine ? "bg-[#6264a7] text-white" : "bg-white text-slate-900 dark:bg-[#2b2b2b] dark:text-white"}`}>
+                      {!mine && <div className="mb-1 text-xs font-medium opacity-70">{message.senderEmail || "User"}</div>}
+                      <div className={`whitespace-pre-wrap break-words ${message.deleted ? "italic opacity-70" : ""}`}>{message.text}</div>
+                      <div className={`mt-1 flex items-center justify-end gap-2 text-[10px] ${mine ? "text-white/70" : "text-slate-500"}`}>
+                        <span>{formatTime(message.timestamp)}</span>
+                        {mine && !message.deleted && (
+                          <button type="button" onClick={() => void deleteMessage(message)} className="hidden rounded p-0.5 hover:bg-black/10 group-hover:inline-flex" title="Delete message">
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
               })
             )}
             <div ref={messagesEndRef} />
-          </div>
+          </section>
 
-          <form onSubmit={sendMessage} className="flex gap-2 border-t border-slate-200 p-4 dark:border-slate-700">
-            <input
-              value={messageText}
-              onChange={(event) => setMessageText(event.target.value)}
-              placeholder="Type a message..."
-              className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-            />
-            <button
-              type="submit"
-              disabled={!messageText.trim()}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-md bg-blue-600 text-white disabled:bg-slate-400"
-              title="Send message"
-            >
-              <Send className="h-4 w-4" />
-            </button>
+          {activeTypingNames.length > 0 && <div className="px-5 py-1 text-xs text-slate-500">{activeTypingNames.join(", ")} typing...</div>}
+
+          <form onSubmit={sendMessage} className="border-t border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-[#1f1f1f]">
+            <div className="flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-2 dark:border-neutral-700 dark:bg-[#242424]">
+              <input value={messageText} onChange={(event) => handleTyping(event.target.value)} placeholder={activeThread.type === "broadcast" && !isHr ? "HR broadcast is read-only" : "Type a new message"} disabled={activeThread.type === "broadcast" && !isHr} className="min-w-0 flex-1 bg-transparent text-sm outline-none disabled:cursor-not-allowed" />
+              <button type="submit" disabled={!messageText.trim() || (activeThread.type === "broadcast" && !isHr)} className="flex h-9 w-9 items-center justify-center rounded-md bg-[#6264a7] text-white disabled:bg-slate-400" title="Send">
+                <Send className="h-4 w-4" />
+              </button>
+            </div>
           </form>
         </main>
       </div>
+
+      {(callState !== CallState.Idle || incomingCall) && (
+        <div className="fixed inset-0 z-40 bg-[#1f1f1f]/95 text-white">
+          <audio ref={remoteAudioRef} autoPlay playsInline />
+          {incomingCall && callState === CallState.Ringing ? (
+            <div className="flex h-full flex-col items-center justify-center gap-6">
+              <div className="relative">
+                <div className="flex h-24 w-24 items-center justify-center rounded bg-[#6264a7] text-3xl font-semibold">{getInitials(incomingCall.callerName)}</div>
+                <div className="absolute inset-0 animate-ping rounded border border-[#8b8cc7]" />
+              </div>
+              <div className="text-center">
+                <h3 className="text-2xl font-semibold">{incomingCall.callerName}</h3>
+                <p className="mt-1 text-sm text-slate-300">Incoming {incomingCall.mode} call</p>
+              </div>
+              <div className="flex items-center gap-5">
+                <button type="button" onClick={() => void rejectCall()} className="flex h-14 w-14 items-center justify-center rounded-full bg-red-600 hover:bg-red-700" title="Reject">
+                  <PhoneOff className="h-6 w-6" />
+                </button>
+                <button type="button" onClick={() => void acceptCall()} className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-600 hover:bg-emerald-700" title="Accept">
+                  <Check className="h-6 w-6" />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex h-full flex-col">
+              <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
+                <div>
+                  <h3 className="font-semibold">{activeThread.title || "Call"}</h3>
+                  <p className="text-xs uppercase tracking-wide text-slate-400">{callState}</p>
+                </div>
+                <div className="flex items-center gap-3 text-xs text-slate-300">
+                  <span className="inline-flex items-center gap-1"><Volume2 className="h-3.5 w-3.5" /> Speaker detection</span>
+                  <select value={selectedAudioDeviceId} onChange={(event) => void switchAudioDevice(event.target.value)} className="rounded border border-white/10 bg-[#2b2b2b] px-2 py-1 outline-none">
+                    <option value="">Default microphone</option>
+                    {audioDevices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || "Microphone"}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid min-h-0 flex-1 gap-3 p-4" style={{ gridTemplateColumns: `repeat(${Math.min(Math.max(participantCards.length + 1, 1), 3)}, minmax(0, 1fr))` }}>
+                <div className="relative overflow-hidden rounded-md bg-[#2b2b2b]">
+                  <video ref={localVideoRef} autoPlay muted playsInline className={`h-full min-h-[220px] w-full object-cover ${cameraEnabled || screenSharing ? "block" : "hidden"}`} />
+                  {!cameraEnabled && !screenSharing && <div className="flex h-full min-h-[220px] items-center justify-center"><div className="flex h-20 w-20 items-center justify-center rounded bg-[#0b6a6f] text-2xl font-semibold">{getInitials(currentUser?.name)}</div></div>}
+                  <div className="absolute bottom-3 left-3 rounded bg-black/60 px-2 py-1 text-xs">You {micEnabled ? "" : "(muted)"}</div>
+                </div>
+
+                {participantCards.map((participant) => (
+                  <div key={participant.uid} className={`relative overflow-hidden rounded-md bg-[#2b2b2b] ring-2 ${participant.speaking ? "ring-emerald-500" : "ring-transparent"}`}>
+                    <video ref={(node) => { remoteVideoRefs.current[participant.uid] = node; }} autoPlay playsInline className={`h-full min-h-[220px] w-full object-cover ${participant.cameraEnabled ? "block" : "hidden"}`} />
+                    {!participant.cameraEnabled && <div className="flex h-full min-h-[220px] items-center justify-center"><div className="flex h-20 w-20 items-center justify-center rounded bg-[#8764b8] text-2xl font-semibold">{getInitials(participant.name)}</div></div>}
+                    <div className="absolute bottom-3 left-3 flex items-center gap-2 rounded bg-black/60 px-2 py-1 text-xs">
+                      <span>{participant.name}</span>
+                      {!participant.micEnabled && <MicOff className="h-3 w-3" />}
+                      <span>{participant.videoQuality}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-center gap-4 border-t border-white/10 p-4">
+                <button type="button" onClick={toggleMic} className={`flex h-11 w-11 items-center justify-center rounded-full ${micEnabled ? "bg-[#3b3b3b]" : "bg-red-600"}`} title={micEnabled ? "Mute" : "Unmute"}>{micEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}</button>
+                <button type="button" onClick={() => void toggleCamera()} className={`flex h-11 w-11 items-center justify-center rounded-full ${cameraEnabled ? "bg-[#3b3b3b]" : "bg-red-600"}`} title={cameraEnabled ? "Camera off" : "Camera on"}>{cameraEnabled ? <Camera className="h-5 w-5" /> : <CameraOff className="h-5 w-5" />}</button>
+                <button type="button" onClick={() => void startScreenShare()} className={`flex h-11 w-11 items-center justify-center rounded-full ${screenSharing ? "bg-[#6264a7]" : "bg-[#3b3b3b]"}`} title="Share screen"><MonitorUp className="h-5 w-5" /></button>
+                <button type="button" onClick={() => void cleanupCall(CallState.Ended, true)} className="flex h-12 w-12 items-center justify-center rounded-full bg-red-600 hover:bg-red-700" title="Leave call"><PhoneOff className="h-5 w-5" /></button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
